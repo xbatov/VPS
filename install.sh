@@ -344,37 +344,6 @@ start_wireguard() {
 }
 
 #############################################
-# Wait Web UI
-#############################################
-
-wait_web(){
-    if [[ "$USE_HTTPS" == "true" ]]; then
-        # Ждём HTTPS (порт 443)
-        local check_port=443
-        local proto="https"
-    else
-        local check_port=${WEB_PORT}
-        local proto="http"
-    fi
-    log "Waiting for Web UI to become available (up to ~120s)..."
-    local max_attempts=60
-    local attempt=0
-
-    while [ $attempt -lt $max_attempts ]; do
-        if curl -fs -k "${proto}://127.0.0.1:${check_port}" >/dev/null 2>&1; then
-            log "Web UI available."
-            return 0
-        fi
-        sleep 2
-        ((attempt++))
-    done
-
-    warn "Web UI still not reachable after timeout."
-    docker logs --tail 100 wg-easy
-    die "Web UI unavailable. Check port, firewall, and container logs."
-}
-
-#############################################
 # Cleanup compose
 #############################################
 
@@ -446,7 +415,6 @@ main(){
     save_credentials
     create_compose
     start_wireguard
-    wait_web
     cleanup_compose
     finish
 }
