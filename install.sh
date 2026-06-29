@@ -13,12 +13,10 @@ set -Eeuo pipefail
 VERSION="1.0"
 
 WG_DIR="/opt/wg-easy"
-
 WG_PORT="51820"
-
 WEB_PORT="51821"
-
 DNS="1.1.1.1"
+CREDENTIALS_FILE="${WG_DIR}/.admin_credentials"   # файл для пароля
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -28,22 +26,10 @@ NC='\033[0m'
 
 #############################################
 
-log(){
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-warn(){
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-error(){
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-die(){
-    error "$1"
-    exit 1
-}
+log()   { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; }
+die()   { error "$1"; exit 1; }
 
 #############################################
 
@@ -64,11 +50,7 @@ EOF
 
 #############################################
 
-check_root(){
-    [[ $EUID -eq 0 ]] || die "Run installer as root."
-}
-
-#############################################
+check_root(){ [[ $EUID -eq 0 ]] || die "Run installer as root."; }
 
 check_os(){
     source /etc/os-release
@@ -76,14 +58,9 @@ check_os(){
     [[ "$VERSION_ID" == "24.04" ]] || die "Ubuntu 24.04 required."
 }
 
-#############################################
-
 check_network(){
-    ping -c1 1.1.1.1 >/dev/null \
-        || die "Internet connection unavailable."
+    ping -c1 1.1.1.1 >/dev/null || die "Internet connection unavailable."
 }
-
-#############################################
 
 update_system(){
     log "Updating packages..."
@@ -91,32 +68,16 @@ update_system(){
     DEBIAN_FRONTEND=noninteractive apt upgrade -y
 }
 
-#############################################
-
 install_packages(){
     log "Installing packages..."
     apt install -y \
-        curl \
-        git \
-        jq \
-        ufw \
-        openssl \
-        ca-certificates \
-        gnupg \
-        lsb-release
+        curl git jq ufw openssl ca-certificates gnupg lsb-release
 }
 
-#############################################
-
 public_ip(){
-    for s in \
-        https://api.ipify.org \
-        https://ifconfig.me/ip \
-        https://ipv4.icanhazip.com
-    do
+    for s in https://api.ipify.org https://ifconfig.me/ip https://ipv4.icanhazip.com; do
         IP=$(curl -4 -fs "$s" 2>/dev/null || true)
-        if [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
-        then
+        if [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
             echo "$IP"
             return
         fi
@@ -124,12 +85,8 @@ public_ip(){
     die "Cannot determine public IP."
 }
 
-#############################################
-
 random_password(){
-    openssl rand -base64 48 \
-        | tr -dc 'A-Za-z0-9' \
-        | head -c 24
+    openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 24
 }
 
 #############################################
@@ -137,12 +94,10 @@ random_password(){
 #############################################
 
 install_docker() {
-    if command -v docker >/dev/null 2>&1
-    then
+    if command -v docker >/dev/null 2>&1; then
         log "Docker already installed."
         return
     fi
-
     log "Installing Docker..."
     curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
     sh /tmp/get-docker.sh
@@ -208,6 +163,14 @@ SERVER_IP=$(public_ip)
 ADMIN_USER="admin"
 ADMIN_PASS=$(random_password)
 
+# Сохраняем пароль в защищённый файл
+echo "Admin credentials for WireGuard Easy" > "${CREDENTIALS_FILE}"
+echo "URL: http://${SERVER_IP}:${WEB_PORT}" >> "${CREDENTIALS_FILE}"
+echo "Username: ${ADMIN_USER}" >> "${CREDENTIALS_FILE}"
+echo "Password: ${ADMIN_PASS}" >> "${CREDENTIALS_FILE}"
+chmod 600 "${CREDENTIALS_FILE}"
+log "Credentials saved to ${CREDENTIALS_FILE}"
+
 #############################################
 # Create compose
 #############################################
@@ -221,7 +184,6 @@ create_compose(){
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             die "Installation aborted by user."
         fi
-        # Бэкап старого compose
         cp "${WG_DIR}/docker-compose.yml" "${WG_DIR}/docker-compose.yml.bak.$(date +%s)"
         log "Backup created."
     fi
@@ -253,12 +215,6 @@ services:
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.src_valid_mark=1
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:51821"]
-      interval: 10s
-      timeout: 5s
-      retries: 8
-      start_period: 60s
 EOF
 }
 
@@ -271,78 +227,6 @@ start_wireguard() {
     cd "${WG_DIR}"
     docker compose pull
     docker compose up -d
-}
-
-#############################################
-# Wait container (using healthcheck)
-#############################################
-
-wait_container(){
-    log "Waiting for container to become healthy (up to ~120s)..."
-    local max_attempts=60
-    local attempt=0
-
-    while [ $attempt -lt $max_attempts ]; do
-        if docker inspect wg-easy >/dev/null 2>&1; then
-            local status
-            status=$(docker inspect --format='{{.State.Health.Status}}' wg-easy 2>/dev/null || echo "starting")
-
-            case "$status" in
-                healthy)
-                    log "Container is healthy."
-                    return 0
-                    ;;
-                unhealthy)
-                    warn "Container is unhealthy (healthcheck failing). Checking logs..."
-                    docker logs --tail 50 wg-easy
-                    die "Healthcheck failed: container is unhealthy."
-                    ;;
-                starting)
-                    # Это нормально для первых секунд
-                    sleep 2
-                    ((attempt++))
-                    continue
-                    ;;
-                *)
-                    warn "Unknown health status: $status. Waiting..."
-                    sleep 2
-                    ((attempt++))
-                    continue
-                    ;;
-            esac
-        else
-            warn "Container not yet created. Waiting..."
-            sleep 2
-            ((attempt++))
-        fi
-    done
-
-    warn "Reached max attempts without becoming healthy."
-    docker logs --tail 100 wg-easy
-    die "Container failed to become healthy within timeout."
-}
-
-#############################################
-# Wait Web UI (fallback if healthcheck fails)
-#############################################
-
-wait_web(){
-    log "Checking Web UI availability (fallback check)..."
-    local max_attempts=60
-    local attempt=0
-
-    while [ $attempt -lt $max_attempts ]; do
-        if curl -fs "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1; then
-            log "Web UI available."
-            return 0
-        fi
-        sleep 2
-        ((attempt++))
-    done
-
-    warn "Web UI still not reachable after timeout."
-    docker logs --tail 100 wg-easy
-    die "Web UI unavailable. Check port, firewall, and container logs."
 }
 
 #############################################
@@ -370,20 +254,18 @@ finish(){
 Installation completed successfully
 
 WireGuard Server
-Host:
-${SERVER_IP}
+Host: ${SERVER_IP}
 
 Web UI
 http://${SERVER_IP}:${WEB_PORT}
 
-Username:
-${ADMIN_USER}
+Username: ${ADMIN_USER}
+Password: ${ADMIN_PASS}
 
-Password:
-${ADMIN_PASS}
+The password has also been saved to:
+${CREDENTIALS_FILE}
 
-WireGuard Port:
-${WG_PORT}/udp
+WireGuard Port: ${WG_PORT}/udp
 
 ==============================================
 
@@ -403,14 +285,12 @@ main(){
     install_packages
     install_docker
     configure_kernel
-    check_ports          # проверка портов перед запуском
+    check_ports
     configure_firewall
     create_dirs
-    create_compose       # включает проверку на существующую установку
+    create_compose
     start_wireguard
-    wait_container       # теперь ждём healthcheck
-    wait_web             # дополнительная проверка
-    cleanup_compose      # бэкап и --force-recreate
+    cleanup_compose
     finish
 }
 
