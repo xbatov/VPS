@@ -163,7 +163,6 @@ SERVER_IP=$(public_ip)
 ADMIN_USER="admin"
 ADMIN_PASS=$(random_password)
 
-# Функция сохранения пароля (будет вызвана после создания директории)
 save_credentials(){
     cat > "${CREDENTIALS_FILE}" <<EOF
 Admin credentials for WireGuard Easy
@@ -180,7 +179,6 @@ EOF
 #############################################
 
 create_compose(){
-    # Проверка существующей установки
     if [[ -f "${WG_DIR}/docker-compose.yml" ]]; then
         warn "Existing installation found in ${WG_DIR}."
         read -p "Do you want to overwrite? (y/N) " -n 1 -r
@@ -234,6 +232,29 @@ start_wireguard() {
 }
 
 #############################################
+# Wait Web UI
+#############################################
+
+wait_web(){
+    log "Waiting for Web UI to become available (up to ~120s)..."
+    local max_attempts=60
+    local attempt=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -fs "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1; then
+            log "Web UI available."
+            return 0
+        fi
+        sleep 2
+        ((attempt++))
+    done
+
+    warn "Web UI still not reachable after timeout."
+    docker logs --tail 100 wg-easy
+    die "Web UI unavailable. Check port, firewall, and container logs."
+}
+
+#############################################
 # Cleanup compose
 #############################################
 
@@ -241,6 +262,8 @@ cleanup_compose(){
     log "Removing INIT_* variables and restarting container with new config..."
     cp "${WG_DIR}/docker-compose.yml" "${WG_DIR}/docker-compose.yml.bak.cleanup"
     sed -i '/INIT_/d' "${WG_DIR}/docker-compose.yml"
+    # Заменяем пустую секцию environment: на environment: {}
+    sed -i 's/^\([[:space:]]*\)environment:[[:space:]]*$/\1environment: {}/' "${WG_DIR}/docker-compose.yml"
     cd "${WG_DIR}"
     docker compose up -d --force-recreate
     log "Container recreated without INIT_* variables."
@@ -291,10 +314,11 @@ main(){
     configure_kernel
     check_ports
     configure_firewall
-    create_dirs               # создаём директорию
-    save_credentials          # сохраняем пароль (теперь директория существует)
+    create_dirs
+    save_credentials
     create_compose
     start_wireguard
+    wait_web
     cleanup_compose
     finish
 }
