@@ -257,8 +257,8 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:51821"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 15s
+      retries: 8
+      start_period: 60s
 EOF
 }
 
@@ -278,21 +278,48 @@ start_wireguard() {
 #############################################
 
 wait_container(){
-    log "Waiting for container to become healthy..."
-    for i in {1..60}
-    do
-        if docker inspect wg-easy >/dev/null 2>&1
-        then
-            STATUS=$(docker inspect --format='{{.State.Health.Status}}' wg-easy 2>/dev/null || echo "starting")
-            if [[ "$STATUS" == "healthy" ]]; then
-                log "Container is healthy."
-                return
-            fi
+    log "Waiting for container to become healthy (up to ~120s)..."
+    local max_attempts=60
+    local attempt=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        if docker inspect wg-easy >/dev/null 2>&1; then
+            local status
+            status=$(docker inspect --format='{{.State.Health.Status}}' wg-easy 2>/dev/null || echo "starting")
+
+            case "$status" in
+                healthy)
+                    log "Container is healthy."
+                    return 0
+                    ;;
+                unhealthy)
+                    warn "Container is unhealthy (healthcheck failing). Checking logs..."
+                    docker logs --tail 50 wg-easy
+                    die "Healthcheck failed: container is unhealthy."
+                    ;;
+                starting)
+                    # Это нормально для первых секунд
+                    sleep 2
+                    ((attempt++))
+                    continue
+                    ;;
+                *)
+                    warn "Unknown health status: $status. Waiting..."
+                    sleep 2
+                    ((attempt++))
+                    continue
+                    ;;
+            esac
+        else
+            warn "Container not yet created. Waiting..."
+            sleep 2
+            ((attempt++))
         fi
-        sleep 2
     done
-    docker logs wg-easy
-    die "Container failed to become healthy."
+
+    warn "Reached max attempts without becoming healthy."
+    docker logs --tail 100 wg-easy
+    die "Container failed to become healthy within timeout."
 }
 
 #############################################
@@ -300,17 +327,22 @@ wait_container(){
 #############################################
 
 wait_web(){
-    log "Waiting Web UI (fallback)..."
-    for i in {1..60}
-    do
-        if curl -fs "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1
-        then
+    log "Checking Web UI availability (fallback check)..."
+    local max_attempts=60
+    local attempt=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -fs "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1; then
             log "Web UI available."
-            return
+            return 0
         fi
         sleep 2
+        ((attempt++))
     done
-    die "Web UI unavailable."
+
+    warn "Web UI still not reachable after timeout."
+    docker logs --tail 100 wg-easy
+    die "Web UI unavailable. Check port, firewall, and container logs."
 }
 
 #############################################
