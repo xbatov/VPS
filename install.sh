@@ -1,161 +1,382 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -e
+set -Eeuo pipefail
 
-echo "====================================="
-echo " VPN Server Installer (WireGuard + wg-easy)"
-echo "====================================="
+#############################################
+#
+# WireGuard Easy Installer
+#
+# Ubuntu 24.04
+#
+#############################################
 
-# Проверка прав root
-if [ "$EUID" -ne 0 ]; then
-    echo "❌ Запустите скрипт от root (sudo)."
+VERSION="1.0"
+
+WG_DIR="/opt/wg-easy"
+
+WG_PORT="51820"
+
+WEB_PORT="51821"
+
+DNS="1.1.1.1"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+#############################################
+
+log(){
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+warn(){
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+error(){
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+die(){
+    error "$1"
     exit 1
-fi
+}
 
-# Запрос параметров
-echo ""
-read -p "Введите публичный IP сервера: " SERVER_IP
-if [ -z "$SERVER_IP" ]; then
-    echo "❌ IP не может быть пустым."
-    exit 1
-fi
+#############################################
 
-read -s -p "Введите пароль для панели wg-easy: " WG_PASSWORD
-echo ""
-if [ -z "$WG_PASSWORD" ]; then
-    echo "❌ Пароль не может быть пустым."
-    exit 1
-fi
+banner(){
+    clear
+    cat <<EOF
 
-# Обновление системы (с подтверждением)
-echo ""
-echo "Будет выполнено обновление пакетов (apt update && apt upgrade -y)."
-read -p "Продолжить? (y/N): " -n 1 -r
-echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo "Обновление системы..."
+==============================================
+
+        WireGuard Easy Installer
+
+              Version ${VERSION}
+
+==============================================
+
+EOF
+}
+
+#############################################
+
+check_root(){
+    [[ $EUID -eq 0 ]] || die "Run installer as root."
+}
+
+#############################################
+
+check_os(){
+    source /etc/os-release
+    [[ "$ID" == "ubuntu" ]] || die "Ubuntu required."
+    [[ "$VERSION_ID" == "24.04" ]] || die "Ubuntu 24.04 required."
+}
+
+#############################################
+
+check_network(){
+    ping -c1 1.1.1.1 >/dev/null \
+        || die "Internet connection unavailable."
+}
+
+#############################################
+
+update_system(){
+    log "Updating packages..."
     apt update
-    apt upgrade -y
-else
-    echo "Обновление пропущено."
-fi
+    DEBIAN_FRONTEND=noninteractive apt upgrade -y
+}
 
-# Установка необходимых пакетов
-echo ""
-echo "Установка необходимых пакетов..."
-apt install -y \
-    curl \
-    wget \
-    git \
-    nano \
-    ufw \
-    ca-certificates
+#############################################
 
-# Установка Docker, если ещё не установлен
-if ! command -v docker &> /dev/null; then
-    echo ""
-    echo "Установка Docker..."
-    curl -fsSL https://get.docker.com | sh
+install_packages(){
+    log "Installing packages..."
+    apt install -y \
+        curl \
+        git \
+        jq \
+        ufw \
+        openssl \
+        ca-certificates \
+        gnupg \
+        lsb-release
+}
+
+#############################################
+
+public_ip(){
+    for s in \
+        https://api.ipify.org \
+        https://ifconfig.me/ip \
+        https://ipv4.icanhazip.com
+    do
+        IP=$(curl -4 -fs "$s" 2>/dev/null || true)
+        if [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+        then
+            echo "$IP"
+            return
+        fi
+    done
+    die "Cannot determine public IP."
+}
+
+#############################################
+
+random_password(){
+    openssl rand -base64 48 \
+        | tr -dc 'A-Za-z0-9' \
+        | head -c 24
+}
+
+#############################################
+# Install Docker
+#############################################
+
+install_docker() {
+    if command -v docker >/dev/null 2>&1
+    then
+        log "Docker already installed."
+        return
+    fi
+
+    log "Installing Docker..."
+    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+    sh /tmp/get-docker.sh
+    rm -f /tmp/get-docker.sh
     systemctl enable docker
     systemctl start docker
-else
-    echo ""
-    echo "Docker уже установлен, пропускаем."
-fi
-
-# Проверка, запущен ли Docker
-if ! systemctl is-active --quiet docker; then
-    echo "Запуск Docker..."
-    systemctl start docker
-fi
-
-# Настройка UFW (сброс правил, но с предупреждением)
-echo ""
-echo "Настройка UFW (правила будут сброшены и пересозданы)."
-read -p "Продолжить? (y/N): " -n 1 -r
-echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow 22/tcp
-    ufw allow 80/tcp
-    ufw allow 443/tcp
-    ufw allow 51820/udp
-    ufw allow 51821/tcp
-    ufw --force enable
-else
-    echo "Настройка UFW пропущена. Убедитесь, что нужные порты открыты вручную."
-fi
-
-# Включение IP-форвардинга
-echo ""
-echo "Включение IP Forward..."
-cat > /etc/sysctl.d/99-wireguard.conf <<EOF
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-EOF
-sysctl --system
-
-# Создание директории и файла docker-compose.yml
-mkdir -p /opt/wg-easy
-cd /opt/wg-easy
-
-# Проверяем, не заняты ли порты
-check_port() {
-    if ss -tuln | grep -q ":$1 "; then
-        echo "❌ Порт $1 уже занят. Запуск невозможен."
-        exit 1
-    fi
+    docker version >/dev/null
 }
-check_port 51820
-check_port 51821
 
-# Генерация docker-compose.yml (способ хранения пароля оставлен как есть)
-cat > docker-compose.yml <<EOF
+#############################################
+# Check ports availability
+#############################################
+
+check_ports(){
+    if ss -lun | grep -qE ":${WG_PORT}\b"; then
+        die "Port ${WG_PORT}/udp is already in use."
+    fi
+    if ss -ltn | grep -qE ":${WEB_PORT}\b"; then
+        die "Port ${WEB_PORT}/tcp is already in use."
+    fi
+    log "Ports ${WG_PORT}/udp and ${WEB_PORT}/tcp are free."
+}
+
+#############################################
+# Configure Kernel
+#############################################
+
+configure_kernel(){
+    log "Enable IP Forwarding..."
+    cat >/etc/sysctl.d/99-wireguard.conf <<EOF
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.src_valid_mark=1
+EOF
+    sysctl --system || warn "sysctl warning (ignored)"
+}
+
+#############################################
+# Configure Firewall
+#############################################
+
+configure_firewall(){
+    log "Configure UFW..."
+    ufw allow OpenSSH || true
+    ufw allow ${WG_PORT}/udp
+    ufw allow ${WEB_PORT}/tcp
+    ufw --force enable
+}
+
+#############################################
+# Create folders
+#############################################
+
+create_dirs(){
+    mkdir -p "${WG_DIR}"
+    mkdir -p "${WG_DIR}/data"
+}
+
+#############################################
+# Generate credentials
+#############################################
+
+SERVER_IP=$(public_ip)
+ADMIN_USER="admin"
+ADMIN_PASS=$(random_password)
+
+#############################################
+# Create compose
+#############################################
+
+create_compose(){
+    # Проверка существующей установки
+    if [[ -f "${WG_DIR}/docker-compose.yml" ]]; then
+        warn "Existing installation found in ${WG_DIR}."
+        read -p "Do you want to overwrite? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            die "Installation aborted by user."
+        fi
+        # Бэкап старого compose
+        cp "${WG_DIR}/docker-compose.yml" "${WG_DIR}/docker-compose.yml.bak.$(date +%s)"
+        log "Backup created."
+    fi
+
+    log "Creating docker-compose.yml..."
+    cat > "${WG_DIR}/docker-compose.yml" <<EOF
 services:
   wg-easy:
-    image: ghcr.io/wg-easy/wg-easy:latest
+    image: ghcr.io/wg-easy/wg-easy:15.3.0
     container_name: wg-easy
     restart: unless-stopped
     environment:
-      - LANG=ru
-      - PASSWORD=${WG_PASSWORD}
-      - WG_HOST=${SERVER_IP}
+      - INIT_ENABLED=true
+      - INIT_USERNAME=${ADMIN_USER}
+      - INIT_PASSWORD=${ADMIN_PASS}
+      - INIT_HOST=${SERVER_IP}
+      - INIT_PORT=${WG_PORT}
+      - INIT_DNS=${DNS}
     volumes:
-      - ./config:/etc/wireguard
+      - ./data:/etc/wireguard
+      - /lib/modules:/lib/modules:ro
     ports:
-      - "51820:51820/udp"
-      - "51821:51821/tcp"
+      - "${WG_PORT}:${WG_PORT}/udp"
+      - "${WEB_PORT}:51821/tcp"
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
+      - NET_RAW
     sysctls:
       - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.src_valid_mark=1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:51821 >/dev/null || wget -qO- http://localhost:51821 >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 EOF
+}
 
-# Запуск/обновление контейнера
-echo ""
-echo "Запуск wg-easy..."
-if docker ps -a --format '{{.Names}}' | grep -q "^wg-easy$"; then
-    echo "Контейнер wg-easy уже существует. Останавливаем и пересоздаём..."
-    docker compose down
+#############################################
+# Start wg-easy
+#############################################
+
+start_wireguard() {
+    log "Starting wg-easy..."
+    cd "${WG_DIR}"
     docker compose pull
-fi
-docker compose up -d
+    docker compose up -d
+}
 
-# Вывод информации
-echo ""
-echo "======================================"
-echo "✅ Установка завершена!"
-echo "======================================"
-echo ""
-echo "🌐 Панель WireGuard:"
-echo "   http://${SERVER_IP}:51821"
-echo "   Пароль: ${WG_PASSWORD}"
-echo ""
-echo "📌 Для управления используйте:"
-echo "   cd /opt/wg-easy && docker compose [up|down|logs|restart]"
-echo ""
-echo "======================================"
+#############################################
+# Wait container (using healthcheck)
+#############################################
+
+wait_container(){
+    log "Waiting for container to become healthy..."
+    for i in {1..60}
+    do
+        if docker inspect wg-easy >/dev/null 2>&1
+        then
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' wg-easy 2>/dev/null || echo "starting")
+            if [[ "$STATUS" == "healthy" ]]; then
+                log "Container is healthy."
+                return
+            fi
+        fi
+        sleep 2
+    done
+    docker logs wg-easy
+    die "Container failed to become healthy."
+}
+
+#############################################
+# Wait Web UI (fallback if healthcheck fails)
+#############################################
+
+wait_web(){
+    log "Waiting Web UI (fallback)..."
+    for i in {1..60}
+    do
+        if curl -fs "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1
+        then
+            log "Web UI available."
+            return
+        fi
+        sleep 2
+    done
+    die "Web UI unavailable."
+}
+
+#############################################
+# Cleanup compose
+#############################################
+
+cleanup_compose(){
+    log "Removing INIT_* variables (no restart needed)"
+    cp "${WG_DIR}/docker-compose.yml" "${WG_DIR}/docker-compose.yml.bak.cleanup"
+    sed -i '/INIT_/d' "${WG_DIR}/docker-compose.yml"
+}
+
+#############################################
+# Finish
+#############################################
+
+finish(){
+    cat <<EOF
+
+==============================================
+
+Installation completed successfully
+
+WireGuard Server
+Host:
+${SERVER_IP}
+
+Web UI
+http://${SERVER_IP}:${WEB_PORT}
+
+Username:
+${ADMIN_USER}
+
+Password:
+${ADMIN_PASS}
+
+WireGuard Port:
+${WG_PORT}/udp
+
+==============================================
+
+EOF
+}
+
+#############################################
+# Main
+#############################################
+
+main(){
+    banner
+    check_root
+    check_os
+    check_network
+    update_system
+    install_packages
+    install_docker
+    configure_kernel
+    check_ports          # проверка портов перед запуском
+    configure_firewall
+    create_dirs
+    create_compose       # включает проверку на существующую установку
+    start_wireguard
+    wait_container       # теперь ждём healthcheck
+    wait_web             # дополнительная проверка
+    cleanup_compose      # бэкап и --force-recreate
+    finish
+}
+
+main "$@"
