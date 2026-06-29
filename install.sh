@@ -16,7 +16,7 @@ WG_DIR="/opt/wg-easy"
 WG_PORT="51820"
 WEB_PORT="51821"
 DNS="1.1.1.1"
-CREDENTIALS_FILE="${WG_DIR}/.admin_credentials"   # файл для пароля
+CREDENTIALS_FILE="${WG_DIR}/.admin_credentials"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -163,13 +163,17 @@ SERVER_IP=$(public_ip)
 ADMIN_USER="admin"
 ADMIN_PASS=$(random_password)
 
-# Сохраняем пароль в защищённый файл
-echo "Admin credentials for WireGuard Easy" > "${CREDENTIALS_FILE}"
-echo "URL: http://${SERVER_IP}:${WEB_PORT}" >> "${CREDENTIALS_FILE}"
-echo "Username: ${ADMIN_USER}" >> "${CREDENTIALS_FILE}"
-echo "Password: ${ADMIN_PASS}" >> "${CREDENTIALS_FILE}"
-chmod 600 "${CREDENTIALS_FILE}"
-log "Credentials saved to ${CREDENTIALS_FILE}"
+# Функция сохранения пароля (будет вызвана после создания директории)
+save_credentials(){
+    cat > "${CREDENTIALS_FILE}" <<EOF
+Admin credentials for WireGuard Easy
+URL: http://${SERVER_IP}:${WEB_PORT}
+Username: ${ADMIN_USER}
+Password: ${ADMIN_PASS}
+EOF
+    chmod 600 "${CREDENTIALS_FILE}"
+    log "Credentials saved to ${CREDENTIALS_FILE}"
+}
 
 #############################################
 # Create compose
@@ -230,6 +234,29 @@ start_wireguard() {
 }
 
 #############################################
+# Wait Web UI (check via curl on host)
+#############################################
+
+wait_web(){
+    log "Waiting for Web UI to become available (up to ~120s)..."
+    local max_attempts=60
+    local attempt=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -fs "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1; then
+            log "Web UI available."
+            return 0
+        fi
+        sleep 2
+        ((attempt++))
+    done
+
+    warn "Web UI still not reachable after timeout."
+    docker logs --tail 100 wg-easy
+    die "Web UI unavailable. Check port, firewall, and container logs."
+}
+
+#############################################
 # Cleanup compose
 #############################################
 
@@ -287,9 +314,11 @@ main(){
     configure_kernel
     check_ports
     configure_firewall
-    create_dirs
+    create_dirs               # создаём директорию
+    save_credentials          # сохраняем пароль (теперь директория существует)
     create_compose
     start_wireguard
+    wait_web
     cleanup_compose
     finish
 }
