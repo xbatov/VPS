@@ -14,9 +14,14 @@ VERSION="1.0"
 
 WG_DIR="/opt/wg-easy"
 WG_PORT="51820"
-WEB_PORT="51821"
+WEB_PORT="51821"       # используется только без HTTPS
 DNS="1.1.1.1"
 CREDENTIALS_FILE="${WG_DIR}/.admin_credentials"
+
+# Переменные для HTTPS
+USE_HTTPS=false
+DOMAIN=""
+EMAIL=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -89,6 +94,57 @@ random_password(){
     openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 24
 }
 
+# Запрос пароля администратора
+ask_password(){
+    local pass1 pass2
+    log "Set admin password (or leave empty to generate random)"
+    while true; do
+        read -sp "Enter password: " pass1
+        echo
+        if [[ -z "$pass1" ]]; then
+            ADMIN_PASS=$(random_password)
+            log "Generated random password."
+            break
+        fi
+        read -sp "Confirm password: " pass2
+        echo
+        if [[ "$pass1" == "$pass2" ]]; then
+            ADMIN_PASS="$pass1"
+            break
+        else
+            warn "Passwords do not match. Try again."
+        fi
+    done
+}
+
+# Запрос настройки HTTPS
+ask_https_config(){
+    local answer
+    read -p "Do you want to enable HTTPS using Let's Encrypt? (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log "HTTPS not enabled. Using HTTP (INSECURE=true)."
+        USE_HTTPS=false
+        return
+    fi
+
+    while true; do
+        read -p "Enter your domain (e.g., vpn.example.com): " DOMAIN
+        if [[ -z "$DOMAIN" ]]; then
+            warn "Domain cannot be empty."
+            continue
+        fi
+        read -p "Enter your email address for Let's Encrypt: " EMAIL
+        if [[ -z "$EMAIL" ]]; then
+            warn "Email cannot be empty."
+            continue
+        fi
+        break
+    done
+    USE_HTTPS=true
+    log "HTTPS will be enabled for domain $DOMAIN with email $EMAIL"
+}
+
 #############################################
 # Install Docker
 #############################################
@@ -115,10 +171,22 @@ check_ports(){
     if ss -lun | grep -qE ":${WG_PORT}\b"; then
         die "Port ${WG_PORT}/udp is already in use."
     fi
-    if ss -ltn | grep -qE ":${WEB_PORT}\b"; then
-        die "Port ${WEB_PORT}/tcp is already in use."
+    if [[ "$USE_HTTPS" == "true" ]]; then
+        # Для HTTPS нужны порты 80 и 443
+        if ss -ltn | grep -qE ":80\b"; then
+            die "Port 80/tcp is already in use (required for Let's Encrypt)."
+        fi
+        if ss -ltn | grep -qE ":443\b"; then
+            die "Port 443/tcp is already in use (required for HTTPS)."
+        fi
+        log "Ports 80 and 443 are free."
+    else
+        if ss -ltn | grep -qE ":${WEB_PORT}\b"; then
+            die "Port ${WEB_PORT}/tcp is already in use."
+        fi
+        log "Port ${WEB_PORT}/tcp is free."
     fi
-    log "Ports ${WG_PORT}/udp and ${WEB_PORT}/tcp are free."
+    log "Port ${WG_PORT}/udp is free."
 }
 
 #############################################
@@ -142,7 +210,12 @@ configure_firewall(){
     log "Configure UFW..."
     ufw allow OpenSSH || true
     ufw allow ${WG_PORT}/udp
-    ufw allow ${WEB_PORT}/tcp
+    if [[ "$USE_HTTPS" == "true" ]]; then
+        ufw allow 80/tcp
+        ufw allow 443/tcp
+    else
+        ufw allow ${WEB_PORT}/tcp
+    fi
     ufw --force enable
 }
 
@@ -156,17 +229,22 @@ create_dirs(){
 }
 
 #############################################
-# Generate credentials
+# Generate credentials (only after password is set)
 #############################################
 
 SERVER_IP=$(public_ip)
 ADMIN_USER="admin"
-ADMIN_PASS=$(random_password)
+ADMIN_PASS=""  # будет установлен позже
 
 save_credentials(){
+    if [[ "$USE_HTTPS" == "true" ]]; then
+        local url="https://${DOMAIN}"
+    else
+        local url="http://${SERVER_IP}:${WEB_PORT}"
+    fi
     cat > "${CREDENTIALS_FILE}" <<EOF
 Admin credentials for WireGuard Easy
-URL: http://${SERVER_IP}:${WEB_PORT}
+URL: ${url}
 Username: ${ADMIN_USER}
 Password: ${ADMIN_PASS}
 EOF
@@ -191,6 +269,46 @@ create_compose(){
     fi
 
     log "Creating docker-compose.yml..."
+    # Строим блок environment и ports в зависимости от USE_HTTPS
+    local env_vars
+    local ports_conf
+
+    if [[ "$USE_HTTPS" == "true" ]]; then
+        env_vars=$(cat <<-EOM
+      - INIT_ENABLED=true
+      - INIT_USERNAME=${ADMIN_USER}
+      - INIT_PASSWORD=${ADMIN_PASS}
+      - INIT_HOST=${DOMAIN}
+      - INIT_PORT=${WG_PORT}
+      - INIT_DNS=${DNS}
+      - LETSENCRYPT_DOMAIN=${DOMAIN}
+      - LETSENCRYPT_EMAIL=${EMAIL}
+EOM
+        )
+        ports_conf=$(cat <<-EOM
+      - "${WG_PORT}:${WG_PORT}/udp"
+      - "80:80"
+      - "443:443"
+EOM
+        )
+    else
+        env_vars=$(cat <<-EOM
+      - INIT_ENABLED=true
+      - INIT_USERNAME=${ADMIN_USER}
+      - INIT_PASSWORD=${ADMIN_PASS}
+      - INIT_HOST=${SERVER_IP}
+      - INIT_PORT=${WG_PORT}
+      - INIT_DNS=${DNS}
+      - INSECURE=true
+EOM
+        )
+        ports_conf=$(cat <<-EOM
+      - "${WG_PORT}:${WG_PORT}/udp"
+      - "${WEB_PORT}:51821/tcp"
+EOM
+        )
+    fi
+
     cat > "${WG_DIR}/docker-compose.yml" <<EOF
 services:
   wg-easy:
@@ -198,18 +316,12 @@ services:
     container_name: wg-easy
     restart: unless-stopped
     environment:
-      - INIT_ENABLED=true
-      - INIT_USERNAME=${ADMIN_USER}
-      - INIT_PASSWORD=${ADMIN_PASS}
-      - INIT_HOST=${SERVER_IP}
-      - INIT_PORT=${WG_PORT}
-      - INIT_DNS=${DNS}
+${env_vars}
     volumes:
       - ./data:/etc/wireguard
       - /lib/modules:/lib/modules:ro
     ports:
-      - "${WG_PORT}:${WG_PORT}/udp"
-      - "${WEB_PORT}:51821/tcp"
+${ports_conf}
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
@@ -236,12 +348,20 @@ start_wireguard() {
 #############################################
 
 wait_web(){
+    if [[ "$USE_HTTPS" == "true" ]]; then
+        # Ждём HTTPS (порт 443)
+        local check_port=443
+        local proto="https"
+    else
+        local check_port=${WEB_PORT}
+        local proto="http"
+    fi
     log "Waiting for Web UI to become available (up to ~120s)..."
     local max_attempts=60
     local attempt=0
 
     while [ $attempt -lt $max_attempts ]; do
-        if curl -fs "http://127.0.0.1:${WEB_PORT}" >/dev/null 2>&1; then
+        if curl -fs -k "${proto}://127.0.0.1:${check_port}" >/dev/null 2>&1; then
             log "Web UI available."
             return 0
         fi
@@ -262,7 +382,7 @@ cleanup_compose(){
     log "Removing INIT_* variables and restarting container with new config..."
     cp "${WG_DIR}/docker-compose.yml" "${WG_DIR}/docker-compose.yml.bak.cleanup"
     sed -i '/INIT_/d' "${WG_DIR}/docker-compose.yml"
-    # Заменяем пустую секцию environment: на environment: {}
+    # Если после удаления INIT_* секция environment стала пустой, преобразуем её в {}
     sed -i 's/^\([[:space:]]*\)environment:[[:space:]]*$/\1environment: {}/' "${WG_DIR}/docker-compose.yml"
     cd "${WG_DIR}"
     docker compose up -d --force-recreate
@@ -274,6 +394,12 @@ cleanup_compose(){
 #############################################
 
 finish(){
+    if [[ "$USE_HTTPS" == "true" ]]; then
+        local url="https://${DOMAIN}"
+    else
+        local url="http://${SERVER_IP}:${WEB_PORT}"
+    fi
+
     cat <<EOF
 
 ==============================================
@@ -284,7 +410,7 @@ WireGuard Server
 Host: ${SERVER_IP}
 
 Web UI
-http://${SERVER_IP}:${WEB_PORT}
+${url}
 
 Username: ${ADMIN_USER}
 Password: ${ADMIN_PASS}
@@ -312,9 +438,11 @@ main(){
     install_packages
     install_docker
     configure_kernel
-    check_ports
+    ask_https_config          # Спрашиваем про HTTPS
+    check_ports               # Проверяем порты с учётом выбора HTTPS
     configure_firewall
     create_dirs
+    ask_password              # Запрашиваем пароль
     save_credentials
     create_compose
     start_wireguard
