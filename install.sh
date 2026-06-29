@@ -254,11 +254,11 @@ services:
       - net.ipv4.ip_forward=1
       - net.ipv4.conf.all.src_valid_mark=1
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:51821 >/dev/null || wget -qO- http://localhost:51821 >/dev/null"]
+      test: ["CMD", "curl", "-f", "http://localhost:51821"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 15s
 EOF
 }
 
