@@ -318,9 +318,12 @@ wait_web(){
 #############################################
 
 cleanup_compose(){
-    log "Removing INIT_* variables (no restart needed)"
+    log "Removing INIT_* variables and restarting container with new config..."
     cp "${WG_DIR}/docker-compose.yml" "${WG_DIR}/docker-compose.yml.bak.cleanup"
     sed -i '/INIT_/d' "${WG_DIR}/docker-compose.yml"
+    cd "${WG_DIR}"
+    docker compose up -d --force-recreate
+    log "Container recreated without INIT_* variables."
 }
 
 #############################################
